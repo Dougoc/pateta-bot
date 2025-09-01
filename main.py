@@ -1,103 +1,218 @@
-import os, asyncio
-from typing import Optional
+"""
+Pateta Bot - Bot do Telegram com integração MCP
+"""
+
+import os
+import asyncio
+import logging
 from telegram import Update
-from telegram.constants import ChatType
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from openai import OpenAI
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ALLOWED_CHAT_IDS = {cid.strip() for cid in os.getenv("ALLOWED_CHAT_IDS","").split(",") if cid.strip()}
+# Importações da nova estrutura
+from config.settings import BOT_TOKEN, ALLOWED_CHAT_IDS, validate_config
+from core.ollama_client import OllamaClient
+from mcp.tools_registry import tools_registry
+from mcp.news_tool import NewsTool
 
-assert BOT_TOKEN, "Defina BOT_TOKEN"
-assert OPENAI_API_KEY, "Defina OPENAI_API_KEY"
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-MODEL = "gpt-4o-mini"  # leve, barato e bom para chat
-SYSTEM = (
-    "Você é um assistente útil de um grupo de amigos no Telegram. "
-    "Responda de forma objetiva, cite passos quando útil e não exponha chaves/segredos."
+# Configuração de logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
-def _is_allowed(update: Update) -> bool:
-    if not ALLOWED_CHAT_IDS:
-        return True
-    chat_id = str(update.effective_chat.id) if update.effective_chat else ""
-    user_id = str(update.effective_user.id) if update.effective_user else ""
-    return (chat_id in ALLOWED_CHAT_IDS) or (user_id in ALLOWED_CHAT_IDS)
+# Instância global do cliente Ollama
+ollama_client = None
+mcp_initialized = False
 
-async def _ask_llm(prompt: str, user: Optional[str]) -> str:
-    # Mensagens no formato Chat Completions
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": prompt if not user else f"[{user}] {prompt}"}
-        ],
-        temperature=0.2,
-        max_tokens=800,
-    )
-    return resp.choices[0].message.content.strip()
+def _is_allowed(chat_id: int, user_id: int) -> bool:
+    """Verifica se o usuário está autorizado"""
+    chat_id_str = str(chat_id)
+    user_id_str = str(user_id)
+    
+    logger.info(f"Chat ID: {chat_id_str}, User ID: {user_id_str}, Allowed: {chat_id_str in ALLOWED_CHAT_IDS}")
+    
+    # Adicionar ID específico do usuário
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_allowed(update):
+    
+    return chat_id_str in ALLOWED_CHAT_IDS
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler para comando /start"""
+    if not _is_allowed(update.effective_chat.id, update.effective_user.id):
         return
-    await update.message.reply_text("Oi! Me use com /ask <pergunta> ou marcando @nome_do_bot no grupo.")
+        
+    logger.info(f"Comando /start recebido de {update.effective_user.first_name}")
+    
+    welcome_message = """Gawrsh! Olá! Eu sou o Pateta! 🤪
 
-async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_allowed(update):
-        return
-    q = " ".join(context.args).strip()
-    if not q:
-        await update.message.reply_text("Uso: /ask <sua pergunta>")
-        return
-    await update.message.chat.send_action(action="typing")
-    answer = await _ask_llm(q, update.effective_user.full_name if update.effective_user else None)
-    await update.message.reply_text(answer, disable_web_page_preview=True)
+Estou aqui para conversar com você e buscar informações quando precisar!
 
-async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Responde quando for mencionado no grupo ou quando a mensagem começar com ! ou /ask."""
-    if not _is_allowed(update):
-        return
-    msg = update.effective_message
-    if not msg or not msg.text:
-        return
+Comandos disponíveis:
+/start - Esta mensagem
+/ask [pergunta] - Faça uma pergunta para mim
+/news [assunto] - Buscar notícias (em breve!)
+/sports [time] - Notícias esportivas (em breve!)
+/weather [cidade] - Clima atual (em breve!)
 
-    text = msg.text.strip()
-    bot_username = (await context.bot.get_me()).username
+Exemplos:
+/ask como você está?
+/ask me conte uma piada
+/news flamengo
+/sports flamengo
+/weather Rio de Janeiro
 
-    mentioned = f"@{bot_username}" in text
-    starts_bang = text.startswith("!")
-    if not (mentioned or starts_bang):
+Lembre-se: Eu sou o Pateta, então posso ser um pouco desajeitado, mas sempre prestativo! 😄"""
+
+    await update.message.reply_text(welcome_message)
+
+async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler para comando /ask"""
+    global mcp_initialized, ollama_client
+    
+    if not _is_allowed(update.effective_chat.id, update.effective_user.id):
         return
-
-    # Limpa a menção ou o prefixo "!"
-    cleaned = text.replace(f"@{bot_username}", "").strip()
-    if cleaned.startswith("!"):
-        cleaned = cleaned[1:].strip()
-    if not cleaned:
+        
+    user_name = update.effective_user.first_name
+    logger.info(f"Comando /ask recebido de {user_name}")
+    
+    # Inicializar MCP se necessário
+    if not mcp_initialized:
+        await setup_mcp_tools()
+        mcp_initialized = True
+    
+    # Extrair pergunta do comando
+    if not context.args:
+        await update.message.reply_text("Gawrsh! Você precisa fazer uma pergunta! Tente: /ask como você está?")
         return
+        
+    question = " ".join(context.args)
+    logger.info(f"Pergunta: {question}")
+    
+    # Mostrar que está digitando
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    try:
+        # Processar com Ollama + MCP
+        answer = await ollama_client.chat(question, user_name)
+        
+        await update.message.reply_text(answer)
+        
+    except Exception as e:
+        logger.error(f"Erro ao processar pergunta: {e}")
+        await update.message.reply_text("Gawrsh! Tive um problema técnico aqui! Tente novamente mais tarde!")
 
-    await msg.chat.send_action(action="typing")
-    answer = await _ask_llm(cleaned, update.effective_user.full_name if update.effective_user else None)
-    # Responde em thread (tópico) se existir, senão reply normal
-    await msg.reply_text(answer, disable_web_page_preview=True)
+async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler para comando /news"""
+    if not _is_allowed(update.effective_chat.id, update.effective_user.id):
+        return
+        
+    user_name = update.effective_user.first_name
+    logger.info(f"Comando /news recebido de {user_name}")
+    
+    # Extrair assunto do comando
+    if not context.args:
+        query = "notícias"
+    else:
+        query = " ".join(context.args)
+    
+    logger.info(f"Buscando notícias sobre: {query}")
+    
+    # Mostrar que está digitando
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    try:
+        # Usar ferramenta de notícias
+        news_tool = tools_registry.get_tool("news_tool")
+        if news_tool:
+            result = await news_tool.execute({"query": query, "limit": 3})
+            
+            if result.get('success') and result.get('data'):
+                news_text = "📰 **Últimas Notícias:**\n\n"
+                for i, item in enumerate(result['data'][:3], 1):
+                    title = item.get('title', 'Sem título')
+                    source = item.get('source', 'Fonte desconhecida')
+                    news_text += f"{i}. {title}\n   📍 {source}\n\n"
+                
+                await update.message.reply_text(news_text, parse_mode='Markdown')
+            else:
+                await update.message.reply_text("Gawrsh! Não consegui encontrar notícias sobre isso!")
+        else:
+            await update.message.reply_text("Gawrsh! A ferramenta de notícias não está disponível!")
+            
+    except Exception as e:
+        logger.error(f"Erro ao buscar notícias: {e}")
+        await update.message.reply_text("Gawrsh! Tive um problema técnico aqui! Tente novamente mais tarde!")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler para mensagens de texto"""
+    global mcp_initialized, ollama_client
+    
+    if not _is_allowed(update.effective_chat.id, update.effective_user.id):
+        return
+        
+    user_name = update.effective_user.first_name
+    message_text = update.message.text
+    
+    logger.info(f"Mensagem recebida de {user_name}: {message_text[:50]}...")
+    
+    # Inicializar MCP se necessário
+    if not mcp_initialized:
+        await setup_mcp_tools()
+        mcp_initialized = True
+    
+    # Mostrar que está digitando
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    try:
+        # Processar com Ollama + MCP
+        answer = await ollama_client.chat(message_text, user_name)
+        
+        await update.message.reply_text(answer)
+        
+    except Exception as e:
+        logger.error(f"Erro ao processar mensagem: {e}")
+        await update.message.reply_text("Gawrsh! Tive um problema técnico aqui! Tente novamente mais tarde!")
+
+async def setup_mcp_tools():
+    """Configura as ferramentas MCP"""
+    global ollama_client
+    
+    logger.info("Configurando ferramentas MCP...")
+    
+    # Registrar ferramentas
+    news_tool = NewsTool()
+    tools_registry.register_tool(news_tool)
+    
+    # Inicializar cliente Ollama
+    ollama_client = OllamaClient()
+    
+    logger.info("Ferramentas MCP configuradas!")
 
 def main():
+    """Função principal"""
+    # Validar configurações
+    try:
+        validate_config()
+    except ValueError as e:
+        logger.error(f"Erro de configuração: {e}")
+        return
+    
+    logger.info("Iniciando bot...")
+    
+    # Criar aplicação
     app = Application.builder().token(BOT_TOKEN).build()
-
+    
+    # Adicionar handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ask", ask))
-
-    # Em grupos: mencione @bot ou use "!"
-    app.add_handler(MessageHandler(
-        filters.TEXT & (filters.ChatType.GROUPS),
-        on_group_message
-    ))
-
-    print("Bot rodando (polling). Ctrl+C para sair.")
-    app.run_polling(close_loop=False)
+    app.add_handler(CommandHandler("news", news))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    logger.info("Bot rodando (polling). Ctrl+C para sair.")
+    
+    # Executar bot
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
